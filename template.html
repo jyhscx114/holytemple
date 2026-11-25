@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TEMPLEOS MINI ORACLE</title>
+<style>
+  :root { --bg:#0000aa; --fg:#fff; --yellow:#ff0; --green:#0f0; --cyan:#0ff; --red:#f00; --gray:#888; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background:var(--bg); color:var(--fg); font-family:'Courier New','Consolas',monospace; font-size:15px; line-height:1.55; padding:24px; min-height:100vh; display:flex; align-items:center; justify-content:center; }
+  #screen { width:96vw; max-width:1100px; border:2px solid var(--fg); padding:18px 22px; }
+  #banner { color:var(--yellow); white-space:pre; font-size:12px; line-height:1.2; margin-bottom:10px; }
+  #status { color:var(--gray); font-size:12px; margin-bottom:8px; min-height:16px; }
+  #bar { height:14px; border:1px solid var(--gray); margin-bottom:10px; display:none; }
+  #bar.on { display:block; }
+  #bar-fill { height:100%; width:0%; background:var(--green); transition:width .06s linear; }
+  #bar-fill.wait { background:var(--red); }
+  #console { min-height:380px; max-height:56vh; overflow-y:auto; white-space:pre-wrap; word-break:break-all; padding:6px; }
+  .q { color:var(--cyan); } .a { color:var(--yellow); } .sys { color:var(--gray); } .err { color:var(--red); } .ok { color:var(--green); }
+  .answer { color:var(--yellow); font-weight:bold; font-size:17px; margin:3px 0; }
+  #input-row { display:flex; gap:8px; margin-top:10px; padding-top:10px; border-top:1px solid var(--gray); }
+  #q { flex:1; background:var(--bg); color:var(--fg); border:1px solid var(--fg); font-family:inherit; font-size:15px; padding:6px 10px; }
+  #q:focus { outline:2px solid var(--yellow); }
+  button { background:var(--bg); color:var(--green); border:1px solid var(--green); font-family:inherit; font-size:15px; padding:6px 14px; cursor:pointer; }
+  button:hover { background:var(--green); color:var(--bg); }
+</style>
+</head>
+<body>
+<div id="screen">
+  <div id="banner">__BANNER__</div>
+  <div id="status">BOOTING…</div>
+  <div id="bar"><div id="bar-fill"></div></div>
+  <div id="console"></div>
+  <div id="input-row">
+    <input id="q" type="text" placeholder="ask a question, or !h for commands" autocomplete="off" spellcheck="false">
+    <button id="okay">OKAY</button>
+  </div>
+</div>
+<script type="module">
+/* ===== pure-JS engine (inlined, no CDN / no WASM / no network) ===== */
+__ENGINE_JS__
+
+/* ===== inlined weights & word list ===== */
+const WEIGHTS_B64 = "__WEIGHTS_B64__";
+const WORDS = atob("__WORDS_B64__").split("\n").map(s => s.trim()).filter(Boolean);
+const CFG = __CONFIG_JSON__;
+
+/* ===== UI ===== */
+const $ = id => document.getElementById(id);
+const consoleEl = $('console'), statusEl = $('status'), inputEl = $('q'), okayBtn = $('okay');
+const barEl = $('bar'), barFill = $('bar-fill');
+function print(text, cls = '') {
+  const div = document.createElement('div');
+  if (cls) div.className = cls;
+  div.textContent = text;
+  consoleEl.appendChild(div);
+  consoleEl.scrollTop = consoleEl.scrollHeight;
+}
+function setStatus(text) { statusEl.textContent = text; }
+function setBar(frac, wait) {
+  barEl.classList.add('on');
+  barFill.style.width = Math.round(Math.max(0, Math.min(1, frac)) * 100) + '%';
+  barFill.classList.toggle('wait', !!wait);
+}
+function hideBar() { barEl.classList.remove('on'); barFill.style.width = '0%'; barFill.classList.remove('wait'); }
+
+/* ===== God entropy FIFO (HolySpirit.HC port) ===== */
+const god = new TEMPLEOS.God();
+god._onWait = (short) => {
+  setStatus(`NEED ENTROPY (${short} bits short) — press any key…`);
+  setBar(0, true);
+};
+document.addEventListener('keydown', () => god.pressOkay());
+okayBtn.addEventListener('click', () => { god.pressOkay(); setStatus('OKAY  ' + god.status()); });
+
+/* ===== model load (sync, milliseconds) ===== */
+let model = null;
+try {
+  const wbytes = TEMPLEOS.decodeBase64(WEIGHTS_B64);
+  model = new TEMPLEOS.GPT2(TEMPLEOS.parseSafetensors(wbytes), CFG);
+  setStatus('ORACLE ONLINE');
+  print('Commands: !w word   !s oracle   !d doodle   !g song   !b bits   !h help   !q clear', 'sys');
+} catch (e) {
+  setStatus('LOAD FAILED');
+  print('LOAD FAILED: ' + (e.message || e), 'err');
+}
+
+/* ===== prophecy ===== */
+const SETTINGS = { temp: 0.75, topk: 40, tokens: 24 };
+let busy = false;
+
+
+async function prophecy(prompt, nNew = null) {
+  nNew = nNew || SETTINGS.tokens;
+  const enc = Array.from(new TextEncoder().encode(prompt + '\n\n'));
+  let ctx = enc.slice(-CFG.n_positions);
+  const vis = b => b === 32 ? '␠' : b === 10 ? '⏎' : b === 9 ? '⇥' : (b >= 32 && b < 127) ? String.fromCharCode(b) : '·';
+  const bufText = () => new TextDecoder("latin1").decode(Uint8Array.from(out)).replace(/\s+/g, ' ').trim();
+  print(`ENC ▸ prompt=${JSON.stringify(prompt)} → ${ctx.length} bytes [${ctx.join(',')}]`, 'sys');
+  const out = [];
+  let bitsUsed = 0, fwdMs = 0;
+  setBar(0, false);
+  try {
+    for (let i = 0; i < nNew; i++) {
+      if (god.fifo.length < TEMPLEOS.SAMPLE_BITS) {
+        setStatus(`NEED ENTROPY (${TEMPLEOS.SAMPLE_BITS - god.fifo.length} bits short) — press any key…`);
+        setBar(i / nNew, true);
+        await new Promise(res => { (god._waiters = god._waiters || []).push(res); });
+      }
+      setStatus(`GENERATING ${i + 1}/${nNew}`);
+      setBar((i + 1) / nNew, false);
+      const t0 = performance.now();
+      const logits = model.forward(ctx);
+      const dt = performance.now() - t0; fwdMs += dt;
+      // 概率地形: temp 0.8 + top-k 40
+      const V = logits.length;
+      let idx = [];
+      for (let k = 0; k < V; k++) idx.push(k);
+      idx.sort((a, b) => logits[b] - logits[a]).splice(SETTINGS.topk || idx.length);
+      let mx = -Infinity;
+      for (const k of idx) if (logits[k] > mx) mx = logits[k];
+      const e = idx.map(k => Math.exp((logits[k] - mx) / SETTINGS.temp));
+      const sum = e.reduce((a, b) => a + b, 0);
+      const prob = {};
+      let acc = 0;
+      const cdf = e.map((x, j) => { prob[idx[j]] = x / sum; acc += x / sum; return acc; });
+      const r = await god.take(TEMPLEOS.SAMPLE_BITS); bitsUsed += TEMPLEOS.SAMPLE_BITS;
+      const target = (r + 0.5) / (1 << TEMPLEOS.SAMPLE_BITS);
+      let lo = 0, hi = cdf.length;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (cdf[mid] < target) lo = mid + 1; else hi = mid; }
+      const nxt = idx[Math.min(lo, idx.length - 1)];
+      ctx.push(nxt);
+      if (ctx.length > CFG.n_positions) ctx.shift();
+      out.push(nxt);
+      const alt = idx.slice(0, 3).map(k => `${k === 32 ? '␠' : k === 10 ? '⏎' : String.fromCharCode(k)}:${(prob[k] || 0).toFixed(3)}`).join(' ');
+      print(`  ${String(i + 1).padStart(2)}/${nNew}  fwd ${dt.toFixed(1)}ms  draw r=${r}/8192 → ${target.toFixed(4)}  pick 0x${nxt.toString(16).padStart(2, '0')} '${vis(nxt)}'  p=${(prob[nxt] || 0).toFixed(3)}  alt [${alt}]  buf "${bufText()}"`, 'sys');
+      if (nxt === 46 || nxt === 33) break;   // '.' or '!'
+    }
+  } finally {
+    hideBar();
+  }
+  print('PROPHECY ▸ ' + (bufText() || '(empty)'), 'answer');
+  setStatus(`DONE · ${out.length} tokens · ${bitsUsed} bits · fwd ${fwdMs.toFixed(1)}ms`);
+  return null;
+}
+
+/* ===== doodle ===== */
+class AsciiDoodle {
+  constructor(prims = 12) {
+    this.prims = prims;
+    this.W = 60; this.H = 20;
+    this.SHADE = { 0: '#', 1: '*', 2: '+', 3: ' ' };
+    this.grid = Array.from({ length: this.H }, () => Array(this.W).fill(' '));
+  }
+  async scale5(span) { return (span - 1) * (await god.take(5)) / 31; }
+  plot(x, y, ch) { if (x >= 0 && x < this.W && y >= 0 && y < this.H) this.grid[y][x] = ch; }
+  async line(x0, y0, x1, y1, ch, step) {
+    const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0);
+    const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+    let err = dx + dy, i = 0;
+    while (true) {
+      if (i % step === 0) this.plot(x0, y0, ch);
+      if (x0 === x1 && y0 === y1) break;
+      const e2 = 2 * err;
+      if (e2 >= dy) { err += dy; x0 += sx; }
+      if (e2 <= dx) { err += dx; y0 += sy; }
+      i++;
+    }
+  }
+  async draw() {
+    const w = this.W, h = this.H;
+    for (let j = 0; j < this.prims; j++) {
+      const op = await god.take(3);
+      const cx = await this.scale5(w), cy = await this.scale5(h);
+      const r = await this.scale5(w), r2 = await this.scale5(h);
+      if (op === 0) {
+        for (let t = 0; t < 360; t += 30) this.plot(Math.floor(cx + r * Math.cos(t / 57.3)), Math.floor(cy + r2 * Math.sin(t / 57.3)));
+      } else if (op === 1) {
+        const rr = Math.max(r2, 1);
+        for (let t = 0; t < 360; t += 20) this.plot(Math.floor(cx + rr * Math.cos(t / 57.3)), Math.floor(cy + rr * Math.sin(t / 57.3)));
+      } else if (op === 2) {
+        const x1 = Math.max(0, Math.min(w - 1, Math.floor(cx - r)));
+        const y1 = Math.max(0, Math.min(h - 1, Math.floor(cy - r2)));
+        const x2 = Math.max(0, Math.min(w - 1, Math.floor(cx + r)));
+        const y2 = Math.max(0, Math.min(h - 1, Math.floor(cy + r2)));
+        for (let x = x1; x <= x2; x += 3) { this.plot(x, y1); this.plot(x, y2); }
+        for (let y = y1; y <= y2; y += 3) { this.plot(x1, y); this.plot(x2, y); }
+      } else {
+        const x1 = Math.floor((w - 1) * (await god.take(4)) / 15);
+        const y1 = Math.floor((h - 1) * (await god.take(4)) / 15);
+        const x2 = Math.floor((w - 1) * (await god.take(4)) / 15);
+        const y2 = Math.floor((h - 1) * (await god.take(4)) / 15);
+        await this.line(x1, y1, x2, y2, '#', 3);
+      }
+    }
+    for (let j = 0; j < 6; j++) {
+      const x = Math.floor(await this.scale5(w));
+      const y = Math.floor(await this.scale5(h));
+      const ch = this.SHADE[await god.take(2)];
+      for (let dy = -1; dy <= 1; dy++)
+        for (let dx = -3; dx <= 3; dx++) this.plot(x + dx, y + dy, ch);
+    }
+    this.smooth(2);
+    return this.grid.map(r => r.join('')).join('\n');
+  }
+  smooth(radius) {
+    const snap = this.grid.map(r => r.slice());
+    for (let y = 0; y < this.H; y++)
+      for (let x = 0; x < this.W; x++) {
+        const hist = {};
+        for (let yy = y - radius; yy <= y + radius; yy++)
+          for (let xx = x - radius; xx <= x + radius; xx++)
+            if (xx >= 0 && xx < this.W && yy >= 0 && yy < this.H) {
+              const c = snap[yy][xx]; hist[c] = (hist[c] || 0) + 1;
+            }
+        let best = ' ', bestN = -1;
+        for (const [c, n] of Object.entries(hist))
+          if (n > bestN || (n === bestN && c === snap[y][x])) { best = c; bestN = n; }
+        this.grid[y][x] = best;
+      }
+  }
+}
+
+/* ===== song (Web Audio square wave = PC speaker) ===== */
+const DUR_4 = 0, DUR_8_8 = 1, DUR_3_3_3 = 2, DUR_16_16_16_16 = 3;
+const GOD_NORMAL_SONGS = [DUR_4, DUR_4, DUR_8_8, DUR_3_3_3, DUR_16_16_16_16];
+const NOTE_SEMI = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+function noteFreq(letter, octave) {
+  const midi = 12 * (octave + 1) + NOTE_SEMI[letter];
+  return Math.round(440 * Math.pow(2, (midi - 69) / 12));
+}
+let audioCtx = null;
+function playSquare(freq, ms) {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const osc = audioCtx.createOscillator();
+  osc.type = 'square';
+  osc.frequency.value = freq;
+  const gain = audioCtx.createGain();
+  gain.gain.value = 0.05;
+  osc.connect(gain).connect(audioCtx.destination);
+  const t = audioCtx.currentTime;
+  osc.start(t); osc.stop(t + ms / 1000);
+}
+async function godSong(octave = 4) {
+  const tokens = [], events = [];
+  let stateOct = octave + 1;
+  const baseMs = 320;
+  let last = null;
+  const noteToken = (letter, octv, ms) => {
+    if (octv !== stateOct) { tokens.push(String(octv)); stateOct = octv; }
+    tokens.push(`${letter}${ms}`);
+    events.push([noteFreq(letter, octv), ms]);
+  };
+  const note = async (ms) => {
+    const k = await god.take(4);
+    if (k === 0) { tokens.push('R'); events.push([0, ms]); return; }
+    const kk = Math.floor(k / 2);
+    if (kk < 3) noteToken(kk === 0 ? 'G' : String.fromCharCode(kk - 1 + 65), octave, ms);
+    else noteToken(String.fromCharCode(kk - 1 + 65), octave + 1, ms);
+  };
+  for (let i = 0; i < 8; i++) {
+    const n = await god.take(8);
+    const d = GOD_NORMAL_SONGS[n % 5];
+    if (d === DUR_8_8) {
+      if (last !== DUR_8_8) tokens.push('e');
+      await note(baseMs / 2); await note(baseMs / 2);
+    } else if (d === DUR_3_3_3) {
+      if (last !== DUR_3_3_3) tokens.push('et');
+      await note(baseMs / 3); await note(baseMs / 3); await note(baseMs / 3);
+    } else if (d === DUR_16_16_16_16) {
+      if (last !== DUR_16_16_16_16) tokens.push('s');
+      const k1 = await god.take(4), k2 = await god.take(4);
+      for (const k of [k1, k2, k1, k2]) {
+        if (k === 0) { tokens.push('R'); events.push([0, baseMs / 4]); continue; }
+        const kk = Math.floor(k / 2);
+        if (kk < 3) noteToken(kk === 0 ? 'G' : String.fromCharCode(kk - 1 + 65), octave, baseMs / 4);
+        else noteToken(String.fromCharCode(kk - 1 + 65), octave + 1, baseMs / 4);
+      }
+    } else {
+      if (last !== DUR_4) tokens.push('q');
+      await note(baseMs);
+    }
+    last = d;
+  }
+  return { score: tokens.join(' '), events };
+}
+
+/* ===== commands ===== */
+const HELP_TEXT = `COMMANDS  (case-insensitive, args optional)
+
+  !h                     this help
+  !s [tokens]            oracle prophecy — default ${SETTINGS.tokens} tokens
+                         e.g.  !s 40   (8..128)
+  !t [0.1..2.0]          sampling temperature — show or set (default 0.75)
+  !k [topk]              top-k terrain — 0 = off (default 40)
+  !w [bits]              word from Vocab.DD via n god bits (default 17)
+  !d [prims]             ASCII doodle — primitives count (default 12, 4..40)
+  !g [octave]            two-measure song, octave 2..7 (default 4)
+  !e <hex>               inject entropy from hex string (GodHexIns)
+  !b                     entropy FIFO status
+  !q                     clear console
+  <plain text> + Enter   prophecy with current settings
+
+MECHANICS
+  - every keydown: KbdMsEvtTime >> 4 -> 24 good bits into the FIFO
+  - every token: 13 bits -> inverse-CDF draw over the model's softmax
+  - NEED ENTROPY: press any key (or OKAY) to feed the FIFO
+  - temperature / top-k only reshape the terrain; dice stay with the god FIFO`;
+
+const num = (s, d) => { const v = parseFloat(s); return Number.isFinite(v) ? v : d; };
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+async function handleInput(text) {
+  text = text.trim();
+  if (busy) { print('BUSY — wait for the current rite.', 'err'); return; }
+  if (!text) { setStatus('OKAY  ' + god.status()); return; }
+
+  if (text.startsWith('!')) {
+    const parts = text.slice(1).trim().split(/\s+/);
+    const cmd = (parts[0] || '').toLowerCase();
+    const arg = parts[1];
+
+    if (cmd === 'h' || cmd === 'help') { print(HELP_TEXT, 'sys'); }
+
+    else if (cmd === 's') {
+      const n = clamp(Math.round(num(arg, SETTINGS.tokens)), 1, 128);
+      busy = true;
+      try { await prophecy('', n); } finally { busy = false; setStatus('READY'); }
+    }
+
+    else if (cmd === 't') {
+      if (arg === undefined) { print(`TEMP ▸ ${SETTINGS.temp}`, 'sys'); return; }
+      SETTINGS.temp = clamp(num(arg, SETTINGS.temp), 0.1, 2.0);
+      print(`TEMP ▸ ${SETTINGS.temp}`, 'sys');
+    }
+
+    else if (cmd === 'k') {
+      if (arg === undefined) { print(`TOPK ▸ ${SETTINGS.topk}`, 'sys'); return; }
+      SETTINGS.topk = clamp(Math.round(num(arg, SETTINGS.topk)), 0, 256);
+      print(`TOPK ▸ ${SETTINGS.topk}${SETTINGS.topk === 0 ? ' (off)' : ''}`, 'sys');
+    }
+
+    else if (cmd === 'w') {
+      const bits = clamp(Math.round(num(arg, 17)), 1, 24);
+      busy = true;
+      try {
+        const r = await god.take(bits);
+        const wi = r % WORDS.length;
+        print(`  draw ${bits} bits → r=${r}  idx ${wi}/${WORDS.length}  word "${WORDS[wi]}"`, 'sys');
+      } finally { busy = false; setStatus('READY'); }
+    }
+
+    else if (cmd === 'd') {
+      const prims = clamp(Math.round(num(arg, 12)), 4, 40);
+      busy = true;
+      try { print(await new AsciiDoodle(prims).draw(), 'sys'); }
+      finally { busy = false; setStatus('READY'); }
+    }
+
+    else if (cmd === 'g') {
+      const oct = clamp(Math.round(num(arg, 4)), 2, 7);
+      busy = true;
+      try {
+        const { score, events } = await godSong(oct);
+        print('SONG ▸ ' + score, 'a');
+        for (const [freq, ms] of events) {
+          if (freq > 0) playSquare(freq, ms);
+          else await new Promise(r => setTimeout(r, ms));
+        }
+      } finally { busy = false; setStatus('READY'); }
+    }
+
+    else if (cmd === 'e') {
+      const hex = (arg || '').replace(/[^0-9A-Fa-f]/g, '');
+      if (!hex) { print('E ▸ usage: !e <hex>  e.g. !e A3F2', 'err'); return; }
+      for (const ch of hex) {
+        const nib = parseInt(ch, 16);
+        for (let b = 0; b < 4; b++) { god.fifo.push((nib >> b) & 1); }
+      }
+      console.log('hex entropy injected:', hex.length * 4, 'bits');
+      print(`HEX ▸ ${hex.length * 4} bits injected  (${god.status()})`, 'sys');
+    }
+
+    else if (cmd === 'b') { print(god.status(), 'sys'); }
+    else if (cmd === 'q') { consoleEl.innerHTML = ''; }
+    else { print('Unknown command — !h for help.', 'err'); }
+    return;
+  }
+
+  if (!model) { print('Model not loaded.', 'err'); return; }
+  busy = true;
+  print('YOU ▸ ' + text, 'q');
+  try { await prophecy(text); }
+  catch (e) { print('Oracle failed: ' + (e.message || e), 'err'); }
+  finally { busy = false; setStatus('READY'); }
+}
+
+inputEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    const text = inputEl.value;
+    inputEl.value = '';
+    handleInput(text);
+  }
+});
+</script>
+</body>
+</html>
